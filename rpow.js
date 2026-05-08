@@ -366,10 +366,23 @@ async function cmdMine(args) {
     1,
     Number(args.flags.inflight) || (args.flags['no-pipeline'] ? 1 : 3),
   );
+
+  // Optional GPU kernel tuning. Default config (4096/256/64) is tuned for
+  // RTX 20-series. Larger values can squeeze 20-30% more hashrate on
+  // bigger cards but waste cycles on tiny ones. Forwarded straight to
+  // rpow-miner-gpu.exe via solveChallengeGpu opts.
+  const gpuGrid = Number(args.flags['gpu-grid']) || undefined;
+  const gpuBlock = Number(args.flags['gpu-block']) || undefined;
+  const gpuBatch = Number(args.flags['gpu-batch']) || undefined;
+  const gpuTuneStr =
+    backend === 'gpu' && (gpuGrid || gpuBlock || gpuBatch)
+      ? ` gpu-tune=${gpuGrid || 'def'}/${gpuBlock || 'def'}/${gpuBatch || 'def'}`
+      : '';
+
   const tag = profile ? `[${profile}] ` : '';
 
   ui.info(
-    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers} inflight=${inFlightCap}. press Ctrl+C to stop.`,
+    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers} inflight=${inFlightCap}${gpuTuneStr}. press Ctrl+C to stop.`,
   );
 
   let stop = false;
@@ -554,6 +567,9 @@ async function cmdMine(args) {
       found = await solveChallenge(challenge, {
         workers,
         backend,
+        grid: gpuGrid,
+        block: gpuBlock,
+        batch: gpuBatch,
         onProgress: ({ total_hashes, elapsed_ms }) => {
           const now = Date.now();
           if (now - lastTick < 1000) return;
@@ -676,10 +692,21 @@ async function cmdMineWorkers(args) {
   );
   const statsMs = Math.max(1000, Number(args.flags['stats-ms']) || 30000);
   const mintRetries = Math.max(0, Number(args.flags['mint-retries']) || 3);
+
+  // Optional GPU kernel tuning -- forwarded to rpow-miner-gpu.exe per
+  // solve. Same flags as `mine`.
+  const gpuGrid = Number(args.flags['gpu-grid']) || undefined;
+  const gpuBlock = Number(args.flags['gpu-block']) || undefined;
+  const gpuBatch = Number(args.flags['gpu-batch']) || undefined;
+  const gpuTuneStr =
+    backend === 'gpu' && (gpuGrid || gpuBlock || gpuBatch)
+      ? ` gpu-tune=${gpuGrid || 'def'}/${gpuBlock || 'def'}/${gpuBatch || 'def'}`
+      : '';
+
   const tag = profile ? `[${profile}] ` : '';
 
   ui.info(
-    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${numWorkers} solve-workers=${solveWorkers}. press Ctrl+C to stop.`,
+    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${numWorkers} solve-workers=${solveWorkers}${gpuTuneStr}. press Ctrl+C to stop.`,
   );
 
   // GPU mutex: chain GPU solver invocations so only one runs at a time.
@@ -781,6 +808,9 @@ async function cmdMineWorkers(args) {
           backend,
           binary: binPath,
           workers: solveWorkers,
+          grid: gpuGrid,
+          block: gpuBlock,
+          batch: gpuBatch,
         };
         found =
           backend === 'gpu'
@@ -1140,6 +1170,12 @@ rpow2 CLI miner – usage:
                     [--backend=native|node|gpu]  pick miner backend
                                        (gpu requires gpu-miner/rpow-miner-gpu.exe;
                                         build via gpu-miner/build.ps1)
+                    [--gpu-grid=N]     CUDA blocks per kernel launch (default 4096)
+                    [--gpu-block=N]    threads per CUDA block (default 256)
+                    [--gpu-batch=N]    nonces per thread (default 64)
+                                       Tip: --gpu-grid=16384 --gpu-block=512
+                                            --gpu-batch=256  ~+30% hashrate
+                                            on RTX 20-series and above
     node rpow.js mine-workers          mine with N parallel challenge->solve->mint
                     [--workers=N]      chains (default = CPU count). Each worker
                     [--solve-workers=K]   has its own /challenge + /mint round-trip
