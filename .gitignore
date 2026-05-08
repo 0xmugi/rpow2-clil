@@ -3,3 +3,11 @@ session.json
 *.log
 .env
 _analysis/
+
+# Rust build artifacts
+miner-rs/target/
+**/*.rs.bk
+
+# misc
+.DS_Store
+Thumbs.db

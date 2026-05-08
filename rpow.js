@@ -5,7 +5,12 @@ const readline = require('readline');
 const session = require('./lib/session');
 const { api, ApiError, API_BASE } = require('./lib/api');
 const ui = require('./lib/ui');
-const { solveChallenge, defaultWorkers } = require('./lib/miner');
+const {
+  solveChallenge,
+  defaultWorkers,
+  activeBackend,
+  nativeBinaryPath,
+} = require('./lib/miner');
 
 // ---------- helpers ----------
 
@@ -240,8 +245,12 @@ async function cmdMine(args) {
 
   const workers = Math.max(1, Number(args.flags.workers) || defaultWorkers());
   const maxTokens = args.flags.max ? Number(args.flags.max) : Infinity;
+  const backend = args.flags.backend || activeBackend();
+  const binPath = backend === 'native' ? nativeBinaryPath() : null;
 
-  ui.info(`mining with ${workers} worker thread(s). press Ctrl+C to stop.`);
+  ui.info(
+    `backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers}. press Ctrl+C to stop.`,
+  );
 
   let stop = false;
   const onSig = () => {
@@ -291,6 +300,7 @@ async function cmdMine(args) {
     try {
       found = await solveChallenge(challenge, {
         workers,
+        backend,
         onProgress: ({ total_hashes, elapsed_ms }) => {
           const now = Date.now();
           if (now - lastTick < 1000) return;
@@ -389,6 +399,7 @@ rpow2 CLI miner – usage:
   node rpow.js activity              show recent transfers
   node rpow.js mine [--workers=N]    mine continuously (default workers = CPU-1)
                   [--max=N]          stop after N tokens
+                  [--backend=native|node]  pick miner backend (auto = native if built)
   node rpow.js logout                clear local session
   node rpow.js help                  this message
 

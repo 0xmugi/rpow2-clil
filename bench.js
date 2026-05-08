@@ -3,7 +3,11 @@
 // Quick correctness + performance check for the miner.
 // Uses a synthetic challenge at difficulty 20 so it completes in ~1 sec.
 
-const { solveChallenge, defaultWorkers } = require('./lib/miner');
+const {
+  solveChallenge,
+  defaultWorkers,
+  activeBackend,
+} = require('./lib/miner');
 const { createHash, randomBytes } = require('crypto');
 
 function trailingZeroBits(digest) {
@@ -41,12 +45,14 @@ async function main() {
   };
 
   const workers = Number(process.argv[3] || defaultWorkers());
+  const backend = process.argv[4] || activeBackend();
   console.log(
-    `benchmarking: difficulty=${difficulty} workers=${workers} prefix=${challenge.nonce_prefix}`,
+    `benchmarking: backend=${backend} difficulty=${difficulty} workers=${workers} prefix=${challenge.nonce_prefix}`,
   );
   const t0 = Date.now();
   const res = await solveChallenge(challenge, {
     workers,
+    backend,
     onProgress: ({ total_hashes, elapsed_ms }) => {
       process.stdout.write(
         `\rprogress: hashes=${Number(total_hashes).toLocaleString()} elapsed=${elapsed_ms}ms`,
