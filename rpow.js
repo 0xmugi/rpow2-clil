@@ -10,6 +10,7 @@ const {
   defaultWorkers,
   activeBackend,
   nativeBinaryPath,
+  gpuBinaryPath,
 } = require('./lib/miner');
 
 // ---------- helpers ----------
@@ -345,7 +346,12 @@ async function cmdMine(args) {
   const workers = Math.max(1, Number(args.flags.workers) || defaultWorkers());
   const maxTokens = args.flags.max ? Number(args.flags.max) : Infinity;
   const backend = args.flags.backend || activeBackend();
-  const binPath = backend === 'native' ? nativeBinaryPath() : null;
+  const binPath =
+    backend === 'native'
+      ? nativeBinaryPath()
+      : backend === 'gpu'
+      ? gpuBinaryPath()
+      : null;
   const refreshIntervalMs = Math.max(
     5000,
     Number(args.flags['refresh-ms']) || 60000,
@@ -806,7 +812,9 @@ rpow2 CLI miner – usage:
     node rpow.js activity              show recent transfers
     node rpow.js mine [--workers=N]    mine continuously (default workers = CPU-1)
                     [--max=N]          stop after N tokens
-                    [--backend=native|node]  pick miner backend
+                    [--backend=native|node|gpu]  pick miner backend
+                                       (gpu requires gpu-miner/rpow-miner-gpu.exe;
+                                        build via gpu-miner/build.ps1)
     node rpow.js logout                clear local session
 
   Multi-account (each profile = its own session file in ./profiles/NAME.json):
@@ -829,7 +837,8 @@ rpow2 CLI miner – usage:
 Environment:
   RPOW_API_BASE              override API base (default ${API_BASE})
   RPOW_SESSION_FILE          override default session file
-  RPOW_BACKEND=native|node   force miner backend
+  RPOW_BACKEND=native|node|gpu   force miner backend
+  RPOW_MINER_GPU_BIN         override path to the GPU miner binary
   TELEGRAM_BOT_TOKEN         token for the bot command
   TELEGRAM_ALLOWED_CHATS     comma-separated chat IDs allowed to query the bot
 `);
