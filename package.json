@@ -1,0 +1,20 @@
+{
+  "name": "rpow2-cli",
+  "version": "1.0.0",
+  "description": "Headless CLI miner for rpow2.com (Hal Finney's RPOW tribute)",
+  "private": true,
+  "main": "rpow.js",
+  "bin": {
+    "rpow": "./rpow.js"
+  },
+  "scripts": {
+    "start": "node rpow.js",
+    "login": "node rpow.js login",
+    "mine": "node rpow.js mine",
+    "status": "node rpow.js status",
+    "logout": "node rpow.js logout"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
