@@ -64,13 +64,21 @@ function describeError(e) {
   return e && e.message ? e.message : String(e);
 }
 
-async function getMe(state, { retries = 4 } = {}) {
+async function getMe(state, { retries = 4, infinite = false } = {}) {
   // Transient network/API errors at startup ("fetch failed", HTTP_500) are
   // common from any consumer ISP -> api.rpow2.com. Retry a few times with
   // backoff before giving up so a one-shot blip doesn't kill `node rpow.js
   // mine`. Auth errors are not retried.
+  //
+  //   retries  : how many transient retries before throwing (default 4).
+  //   infinite : when true, ignore `retries` and keep retrying forever
+  //              with adaptive backoff (capped at 60 s). Use this from
+  //              long-running miners where a 5-minute outage is no reason
+  //              to abort -- we'd rather wait than make the user retype
+  //              the command.
+  let attempt = 0;
   let lastErr;
-  for (let attempt = 0; attempt <= retries; attempt++) {
+  while (true) {
     try {
       return await api.me(state);
     } catch (e) {
@@ -81,13 +89,16 @@ async function getMe(state, { retries = 4 } = {}) {
         return null;
       }
       lastErr = e;
-      if (attempt < retries) {
-        const delay = 500 * (attempt + 1); // 0.5s, 1s, 1.5s, 2s
-        ui.warn(
-          `getMe failed (${describeError(e)}); retry ${attempt + 1}/${retries} in ${delay}ms`,
-        );
-        await sleep(delay);
-      }
+      attempt += 1;
+      if (!infinite && attempt > retries) break;
+      const delay = infinite
+        ? backoffMsFor(attempt, e)
+        : 500 * attempt; // fixed schedule for finite mode: 0.5s,1s,1.5s,2s
+      const tail = infinite
+        ? `retry ${attempt} in ${(delay / 1000).toFixed(1)}s`
+        : `retry ${attempt}/${retries} in ${delay}ms`;
+      ui.warn(`getMe failed (${describeError(e)}); ${tail}`);
+      await sleep(delay);
     }
   }
   throw lastErr;
@@ -335,11 +346,12 @@ async function ensureLoggedIn(profile) {
 async function cmdMine(args) {
   const profile = args.flags.profile;
   const state = await ensureLoggedIn(profile);
-  // Use the retry-aware getMe here so a one-shot network blip on the very
-  // first /me right after login doesn't kill the miner with `fetch failed`.
-  const me = await getMe(state);
+  // Mining is a long-running command -- a transient API outage on the
+  // initial /me should not force the user to retype the command. Retry
+  // forever with adaptive backoff; only an actual auth failure aborts.
+  const me = await getMe(state, { infinite: true });
   if (!me) {
-    ui.err('session unexpectedly invalid right after login; aborting.');
+    ui.err('session expired; please re-run to log in again.');
     process.exit(1);
   }
   printAccount(me, profile);
@@ -528,13 +540,14 @@ async function cmdMine(args) {
       }
       consecChallengeFails += 1;
       const wait = backoffMsFor(consecChallengeFails, e);
-      if (consecChallengeFails >= 3) {
-        ui.warn(
-          `challenge failed: ${describeError(e)} — backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`,
-        );
-      } else {
-        ui.err(`challenge failed: ${describeError(e)}`);
-      }
+      // Always logged as a warning -- the loop is handling it gracefully
+      // and will keep retrying, so the scary red `x` prefix only shows
+      // up for things we genuinely can't recover from (e.g. auth lost).
+      const tail =
+        consecChallengeFails === 1
+          ? `retrying in ${(wait / 1000).toFixed(1)}s`
+          : `backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`;
+      ui.warn(`challenge failed: ${describeError(e)} — ${tail}`);
       await sleep(wait);
       pendingChallenge = fetchChallenge();
       continue;
@@ -661,9 +674,9 @@ async function cmdRun(args) {
 async function cmdMineWorkers(args) {
   const profile = args.flags.profile;
   const state = await ensureLoggedIn(profile);
-  const me = await getMe(state);
+  const me = await getMe(state, { infinite: true });
   if (!me) {
-    ui.err('session unexpectedly invalid right after login; aborting.');
+    ui.err('session expired; please re-run to log in again.');
     process.exit(1);
   }
   printAccount(me, profile);
@@ -783,13 +796,11 @@ async function cmdMineWorkers(args) {
         totalErrors += 1;
         consecChallengeFails += 1;
         const wait = backoffMsFor(consecChallengeFails, e);
-        if (consecChallengeFails >= 3) {
-          ui.warn(
-            `[w${workerId}] challenge: ${describeError(e)} — backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`,
-          );
-        } else {
-          ui.warn(`[w${workerId}] challenge: ${describeError(e)}`);
-        }
+        const tail =
+          consecChallengeFails === 1
+            ? `retrying in ${(wait / 1000).toFixed(1)}s`
+            : `backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`;
+        ui.warn(`[w${workerId}] challenge: ${describeError(e)} — ${tail}`);
         await sleep(wait);
         continue;
       }
