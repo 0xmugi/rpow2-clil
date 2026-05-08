@@ -674,6 +674,12 @@ async function cmdMineAll(args) {
     ];
     if (args.flags.max) argv.push(`--max=${args.flags.max}`);
     if (args.flags.backend) argv.push(`--backend=${args.flags.backend}`);
+    if (args.flags.inflight) argv.push(`--inflight=${args.flags.inflight}`);
+    if (args.flags['mint-retries'])
+      argv.push(`--mint-retries=${args.flags['mint-retries']}`);
+    if (args.flags['no-pipeline']) argv.push('--no-pipeline');
+    if (args.flags['refresh-ms'])
+      argv.push(`--refresh-ms=${args.flags['refresh-ms']}`);
     const child = spawn(process.execPath, argv, {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: process.env,
