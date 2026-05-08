@@ -202,7 +202,56 @@ You should see `backend=native` in the first log line, then 2 tokens minted
 in a few seconds. If you see `backend=node`, the Rust binary wasn't built —
 re-run `bash setup-vps.sh`.
 
-### Step 4 — Run 24/7 as a systemd service
+### Step 4 — Multi-account mining + Telegram bot (recommended)
+
+If you already have several profiles set up on your laptop (e.g.
+`profiles/cecen.json`, `profiles/namc.json`) and a `bot.json` with your
+Telegram token, migrating to a new VPS is two scp commands plus one script.
+
+**On your LAPTOP (PowerShell or bash)** — copy what you already have:
+
+```bash
+# replace VPS_IP and the user (root for most HostBrr/Hetzner-style VPS)
+scp profiles/*.json root@VPS_IP:~/rpow/profiles/
+scp bot.json        root@VPS_IP:~/rpow/
+```
+
+**On the VPS** — install both services with one script:
+
+```bash
+cd ~/rpow
+bash install-multi.sh
+rpow-start
+```
+
+`install-multi.sh` will:
+
+- Auto-detect every `profiles/*.json` you copied and mine all of them
+  in parallel (`mine-all --profiles=...`).
+- Install a `rpow-miner.service` systemd unit (mining loop).
+- Install a `rpow-bot.service` if `bot.json` is present (Telegram bot).
+- Auto-tune `--workers=N` so each profile gets `cores / num_profiles`.
+- Add convenience helpers to `/usr/local/bin`:
+  `rpow-start`, `rpow-stop`, `rpow-restart`, `rpow-status`,
+  `rpow-logs [miner|bot|journal]`, `rpow-update`.
+- Create a 2GB swap file on low-RAM (<2GB) plans.
+
+It is idempotent — re-run it any time you add/remove a profile, or pass
+overrides:
+
+```bash
+PROFILES=cecen,namc WORKERS=2 WITH_BOT=false bash install-multi.sh
+```
+
+> **Migration tip:** before running `rpow-start` on the new VPS, make sure
+> your old VPS / laptop is **not** mining the same profiles, otherwise both
+> will keep invalidating each other's challenges and the API may rate-limit
+> you. Stop the old service first:
+> `sudo systemctl stop rpow` (old VPS) or kill the local `node rpow.js mine`.
+
+### Step 4-alt — Single-account systemd service (legacy)
+
+If you only mine one account on the VPS, the simpler flow is:
 
 ```bash
 cd ~/rpow
@@ -229,6 +278,14 @@ sudo systemctl daemon-reload
 ```
 
 ### Step 5 — Updating the miner later
+
+Multi-account setup (Step 4):
+
+```bash
+rpow-update     # git pull + rebuild + restart all services
+```
+
+Single-account legacy setup:
 
 ```bash
 cd ~/rpow

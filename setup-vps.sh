@@ -111,28 +111,32 @@ log "native miner ready: $BIN"
 cat <<EOF
 
 ================================================================
-  rpow2-cli is ready.
+  rpow2-cli build is ready.
 
   Next steps:
 
-  1. Login (one of these):
+  ── Multi-account + Telegram bot (recommended) ──
 
-     a) From this VPS (need email access on your phone/laptop):
-        node rpow.js login your@email.com
-        # then paste the magic link from the email
+  1. From your LAPTOP, copy your existing profiles & bot config:
 
-     b) Or upload session.json from a machine where you already
-        logged in (much easier if you run multiple VPS):
-        scp session.json $USER@<this-vps-ip>:$SCRIPT_DIR/
+       scp profiles/*.json $USER@<this-vps-ip>:$SCRIPT_DIR/profiles/
+       scp bot.json        $USER@<this-vps-ip>:$SCRIPT_DIR/
 
-  2. Quick mining test:
-        node rpow.js mine --max=2
+  2. Back on this VPS, install systemd services:
 
-  3. Run continuously in the background:
-        nohup node rpow.js mine > miner.log 2>&1 &
-        tail -f miner.log
+       bash $SCRIPT_DIR/install-multi.sh
 
-  4. Or as a systemd service (recommended for 24/7 mining):
-        bash $SCRIPT_DIR/install-service.sh
+  3. Start mining + bot:
+
+       rpow-start
+
+  ── Single-account legacy mode ──
+
+     a) Login here:    node rpow.js login your@email.com
+        or upload:     scp session.json $USER@<this-vps-ip>:$SCRIPT_DIR/
+
+     b) Quick test:    node rpow.js mine --max=2
+
+     c) 24/7 service:  bash $SCRIPT_DIR/install-service.sh
 ================================================================
 EOF
