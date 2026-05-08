@@ -247,6 +247,10 @@ async function cmdMine(args) {
   const maxTokens = args.flags.max ? Number(args.flags.max) : Infinity;
   const backend = args.flags.backend || activeBackend();
   const binPath = backend === 'native' ? nativeBinaryPath() : null;
+  const refreshIntervalMs = Math.max(
+    5000,
+    Number(args.flags['refresh-ms']) || 60000,
+  );
 
   ui.info(
     `backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers}. press Ctrl+C to stop.`,
@@ -267,12 +271,27 @@ async function cmdMine(args) {
   let mined = 0;
   let totalHashes = 0n;
   const sessionStart = Date.now();
+  let displayBalance = Number(me.balance) || 0;
+  let displayMinted = Number(me.minted) || 0;
+  let lastMeAt = Date.now();
+
+  // Helper that wraps api.challenge() so a rejection becomes a sentinel
+  // value we can inspect after `await`. This lets us prefetch the next
+  // challenge concurrently with mining + minting the current one without
+  // unhandled rejection warnings.
+  const fetchChallenge = () =>
+    api.challenge(state).then(
+      (c) => ({ ok: true, challenge: c }),
+      (e) => ({ ok: false, error: e }),
+    );
+
+  // Prefetch the first challenge.
+  let pendingChallenge = fetchChallenge();
 
   while (!stop && mined < maxTokens) {
-    let challenge;
-    try {
-      challenge = await api.challenge(state);
-    } catch (e) {
+    const got = await pendingChallenge;
+    if (!got.ok) {
+      const e = got.error;
       if (
         e instanceof ApiError &&
         (e.status === 401 || e.code === 'UNAUTHORIZED')
@@ -283,8 +302,16 @@ async function cmdMine(args) {
       }
       ui.err(`challenge failed: ${describeError(e)}`);
       await sleep(3000);
+      pendingChallenge = fetchChallenge();
       continue;
     }
+    const challenge = got.challenge;
+
+    // Kick off prefetch of the NEXT challenge in parallel with mining +
+    // minting the current one. By the time we finish minting, the next
+    // challenge is usually already in hand, saving one network round-trip
+    // per token.
+    pendingChallenge = fetchChallenge();
 
     ui.info(
       `challenge ${challenge.challenge_id} difficulty=${challenge.difficulty_bits} bits prefix=${shorten(
@@ -353,18 +380,48 @@ async function cmdMine(args) {
 
     mined += 1;
     totalHashes += found.hashes;
+
+    // Try to read updated balance from mint response; otherwise derive it
+    // from a local counter so we don't have to issue a separate /me request
+    // after every token (saves one round-trip per mint).
+    const balanceFromMint =
+      pickNumber(mintRes, ['balance', 'user.balance', 'account.balance']);
+    const mintedFromMint = pickNumber(mintRes, [
+      'minted',
+      'user.minted',
+      'account.minted',
+    ]);
+    if (typeof balanceFromMint === 'number') {
+      displayBalance = balanceFromMint;
+    } else {
+      displayBalance += 1;
+    }
+    if (typeof mintedFromMint === 'number') {
+      displayMinted = mintedFromMint;
+    } else {
+      displayMinted += 1;
+    }
+
     const tokenId = mintRes && mintRes.token && mintRes.token.id;
     ui.info(
-      `+ minted ${tokenId ? `token ${shorten(tokenId)} ` : ''}(this run: ${mined}, total hashes: ${ui.fmtNum(Number(totalHashes))}, uptime: ${ui.fmtElapsed(Date.now() - sessionStart)})`,
+      `+ minted ${tokenId ? `token ${shorten(tokenId)} ` : ''}(run: ${mined}, balance: ${displayBalance}, total hashes: ${ui.fmtNum(Number(totalHashes))}, uptime: ${ui.fmtElapsed(Date.now() - sessionStart)})`,
     );
 
-    try {
-      const fresh = await api.me(state);
-      ui.info(
-        `  balance=${fresh.balance} minted=${fresh.minted} sent=${fresh.sent} received=${fresh.received}`,
+    // Periodically refresh full account from /me (non-blocking).
+    if (Date.now() - lastMeAt >= refreshIntervalMs) {
+      lastMeAt = Date.now();
+      api.me(state).then(
+        (fresh) => {
+          displayBalance = Number(fresh.balance) || displayBalance;
+          displayMinted = Number(fresh.minted) || displayMinted;
+          ui.info(
+            `  refresh: balance=${fresh.balance} minted=${fresh.minted} sent=${fresh.sent} received=${fresh.received}`,
+          );
+        },
+        () => {
+          /* non-fatal */
+        },
       );
-    } catch {
-      /* non-fatal */
     }
   }
 
@@ -377,6 +434,27 @@ async function cmdRun(args) {
   // default flow: login if needed, then mine forever.
   printBanner();
   await cmdMine(args);
+}
+
+// Look up the first present numeric value at any of the dotted paths.
+// Used to extract balance/minted counters from /mint responses without
+// caring about the exact server schema.
+function pickNumber(obj, paths) {
+  if (!obj) return undefined;
+  for (const p of paths) {
+    let cur = obj;
+    let ok = true;
+    for (const seg of p.split('.')) {
+      if (cur && typeof cur === 'object' && seg in cur) {
+        cur = cur[seg];
+      } else {
+        ok = false;
+        break;
+      }
+    }
+    if (ok && typeof cur === 'number' && Number.isFinite(cur)) return cur;
+  }
+  return undefined;
 }
 
 function shorten(s) {
