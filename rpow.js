@@ -350,10 +350,19 @@ async function cmdMine(args) {
     5000,
     Number(args.flags['refresh-ms']) || 60000,
   );
+  // Mint pipelining: while a /mint request is in flight (~3s round-trip),
+  // we can already start mining the NEXT challenge so the CPU is never idle
+  // waiting for the network. Cap the number of concurrent mints to avoid
+  // runaway / accidental rate limiting. Default 3 covers mint_time/mine_time
+  // ratios up to ~3x. Override with --inflight=N.
+  const inFlightCap = Math.max(
+    1,
+    Number(args.flags.inflight) || (args.flags['no-pipeline'] ? 1 : 3),
+  );
   const tag = profile ? `[${profile}] ` : '';
 
   ui.info(
-    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers}. press Ctrl+C to stop.`,
+    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers} inflight=${inFlightCap}. press Ctrl+C to stop.`,
   );
 
   let stop = false;
@@ -363,12 +372,13 @@ async function cmdMine(args) {
       process.exit(130);
     }
     stop = true;
-    ui.info('stopping after current attempt ...');
+    ui.info('stopping after current attempt (waiting for in-flight mints) ...');
   };
   process.on('SIGINT', onSig);
   process.on('SIGTERM', onSig);
 
-  let mined = 0;
+  let mined = 0; // tokens whose /mint succeeded
+  let started = 0; // tokens whose mining started (incl. in-flight + failed)
   let totalHashes = 0n;
   const sessionStart = Date.now();
   let displayBalance = Number(me.balance) || 0;
@@ -388,7 +398,98 @@ async function cmdMine(args) {
   // Prefetch the first challenge.
   let pendingChallenge = fetchChallenge();
 
-  while (!stop && mined < maxTokens) {
+  // Set of in-flight mint promises. Populated by `fireMint`, cleaned up
+  // automatically when each promise settles. We use a Set rather than an
+  // array so we can `Promise.race` cheaply and remove by reference.
+  const inFlightMints = new Set();
+
+  // Submit a /mint for the just-solved challenge as a background task.
+  // The promise itself never rejects: any error is caught + logged, so
+  // `Promise.race` / `Promise.all` over the set is always safe.
+  //
+  // Transient failures ("fetch failed", HTTP_500, etc.) are retried with
+  // backoff so a flaky network doesn't cost us tokens we already mined.
+  // STALE_CHALLENGE is permanent (challenge gone) so we drop immediately.
+  const mintRetries = Math.max(0, Number(args.flags['mint-retries']) || 3);
+  const fireMint = (challenge, found) => {
+    const cidShort = shorten(challenge.challenge_id);
+    const p = (async () => {
+      let lastErr;
+      for (let attempt = 0; attempt <= mintRetries; attempt++) {
+        try {
+          const mintRes = await api.mint(
+            {
+              challenge_id: challenge.challenge_id,
+              solution_nonce: found.solution_nonce,
+            },
+            state,
+          );
+          mined += 1;
+          // Update displayed balance: prefer server-reported value, else
+          // increment locally.
+          const balanceFromMint = pickNumber(mintRes, [
+            'balance',
+            'user.balance',
+            'account.balance',
+          ]);
+          const mintedFromMint = pickNumber(mintRes, [
+            'minted',
+            'user.minted',
+            'account.minted',
+          ]);
+          if (typeof balanceFromMint === 'number') {
+            displayBalance = balanceFromMint;
+          } else {
+            displayBalance += 1;
+          }
+          if (typeof mintedFromMint === 'number') {
+            displayMinted = mintedFromMint;
+          } else {
+            displayMinted += 1;
+          }
+          const tokenId = mintRes && mintRes.token && mintRes.token.id;
+          ui.info(
+            `+ minted ${tokenId ? `token ${shorten(tokenId)} ` : ''}(run: ${mined}, balance: ${displayBalance}, total hashes: ${ui.fmtNum(Number(totalHashes))}, uptime: ${ui.fmtElapsed(Date.now() - sessionStart)})${attempt > 0 ? ` [after ${attempt} retry]` : ''}`,
+          );
+          return;
+        } catch (e) {
+          lastErr = e;
+          // Permanent: don't retry.
+          if (e instanceof ApiError && e.code === 'STALE_CHALLENGE') {
+            ui.warn(
+              `challenge ${cidShort} expired before submission, dropped`,
+            );
+            return;
+          }
+          if (
+            e instanceof ApiError &&
+            (e.status === 401 || e.code === 'UNAUTHORIZED')
+          ) {
+            ui.warn(`${tag}session expired during mint; will stop loop.`);
+            stop = true;
+            session.clear(state);
+            return;
+          }
+          // Transient: backoff + retry.
+          if (attempt < mintRetries) {
+            const delay = 500 * (attempt + 1);
+            ui.warn(
+              `mint ${cidShort} failed (${describeError(e)}); retry ${attempt + 1}/${mintRetries} in ${delay}ms`,
+            );
+            await sleep(delay);
+          }
+        }
+      }
+      ui.err(
+        `mint ${cidShort} failed after ${mintRetries + 1} attempts: ${describeError(lastErr)}`,
+      );
+    })();
+    inFlightMints.add(p);
+    p.finally(() => inFlightMints.delete(p));
+    return p;
+  };
+
+  while (!stop && started < maxTokens) {
     const got = await pendingChallenge;
     if (!got.ok) {
       const e = got.error;
@@ -459,53 +560,19 @@ async function cmdMine(args) {
       `solved in ${ui.fmtElapsed(found.elapsed_ms)} (${ui.fmtNum(Number(found.hashes))} hashes, ${ui.fmtRate(rate)}, tz=${found.trailing_zero_bits} bits)`,
     );
 
-    let mintRes;
-    try {
-      mintRes = await api.mint(
-        {
-          challenge_id: challenge.challenge_id,
-          solution_nonce: found.solution_nonce,
-        },
-        state,
-      );
-    } catch (e) {
-      if (e instanceof ApiError && e.code === 'STALE_CHALLENGE') {
-        ui.warn('challenge expired before submission, retrying ...');
-        continue;
-      }
-      ui.err(`mint failed: ${describeError(e)}`);
-      await sleep(2000);
-      continue;
-    }
-
-    mined += 1;
+    started += 1;
     totalHashes += found.hashes;
 
-    // Try to read updated balance from mint response; otherwise derive it
-    // from a local counter so we don't have to issue a separate /me request
-    // after every token (saves one round-trip per mint).
-    const balanceFromMint =
-      pickNumber(mintRes, ['balance', 'user.balance', 'account.balance']);
-    const mintedFromMint = pickNumber(mintRes, [
-      'minted',
-      'user.minted',
-      'account.minted',
-    ]);
-    if (typeof balanceFromMint === 'number') {
-      displayBalance = balanceFromMint;
-    } else {
-      displayBalance += 1;
-    }
-    if (typeof mintedFromMint === 'number') {
-      displayMinted = mintedFromMint;
-    } else {
-      displayMinted += 1;
-    }
+    // Submit /mint as a background task. The CPU is now free to start
+    // mining the next challenge while this mint is in flight (~3s).
+    fireMint(challenge, found);
 
-    const tokenId = mintRes && mintRes.token && mintRes.token.id;
-    ui.info(
-      `+ minted ${tokenId ? `token ${shorten(tokenId)} ` : ''}(run: ${mined}, balance: ${displayBalance}, total hashes: ${ui.fmtNum(Number(totalHashes))}, uptime: ${ui.fmtElapsed(Date.now() - sessionStart)})`,
-    );
+    // Backpressure: cap concurrent mints. If we're over the cap, wait for
+    // ANY one to finish before starting the next mining round. Using
+    // Promise.race so we resume as soon as one slot frees up, not all.
+    if (inFlightMints.size >= inFlightCap) {
+      await Promise.race(inFlightMints);
+    }
 
     // Periodically refresh full account from /me (non-blocking).
     if (Date.now() - lastMeAt >= refreshIntervalMs) {
@@ -525,9 +592,17 @@ async function cmdMine(args) {
     }
   }
 
+  // Drain any pending mints before reporting "done".
+  if (inFlightMints.size > 0) {
+    ui.info(`waiting for ${inFlightMints.size} pending mint(s) to finish ...`);
+    await Promise.all(inFlightMints);
+  }
+
   process.off('SIGINT', onSig);
   process.off('SIGTERM', onSig);
-  ui.info(`done. mined ${mined} token(s) in ${ui.fmtElapsed(Date.now() - sessionStart)}.`);
+  ui.info(
+    `done. mined ${mined}/${started} token(s) in ${ui.fmtElapsed(Date.now() - sessionStart)}.`,
+  );
 }
 
 async function cmdRun(args) {
