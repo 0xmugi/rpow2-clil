@@ -405,6 +405,11 @@ async function cmdMine(args) {
   // Prefetch the first challenge.
   let pendingChallenge = fetchChallenge();
 
+  // Tracks how many consecutive /challenge failures we've seen so the
+  // backoff can escalate from a quick retry to a long sleep when the
+  // upstream is hard-down (e.g. 502/504 storm).
+  let consecChallengeFails = 0;
+
   // Set of in-flight mint promises. Populated by `fireMint`, cleaned up
   // automatically when each promise settles. We use a Set rather than an
   // array so we can `Promise.race` cheaply and remove by reference.
@@ -508,12 +513,25 @@ async function cmdMine(args) {
         session.clear(state);
         break;
       }
-      ui.err(`challenge failed: ${describeError(e)}`);
-      await sleep(3000);
+      consecChallengeFails += 1;
+      const wait = backoffMsFor(consecChallengeFails, e);
+      if (consecChallengeFails >= 3) {
+        ui.warn(
+          `challenge failed: ${describeError(e)} — backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`,
+        );
+      } else {
+        ui.err(`challenge failed: ${describeError(e)}`);
+      }
+      await sleep(wait);
       pendingChallenge = fetchChallenge();
       continue;
     }
     const challenge = got.challenge;
+    // Successful fetch — reset the outage backoff counter.
+    if (consecChallengeFails > 0) {
+      ui.info(`challenge endpoint recovered after ${consecChallengeFails} failure(s).`);
+      consecChallengeFails = 0;
+    }
 
     // Kick off prefetch of the NEXT challenge in parallel with mining +
     // minting the current one. By the time we finish minting, the next
@@ -715,6 +733,10 @@ async function cmdMineWorkers(args) {
 
   const runOne = async (workerId) => {
     const ws = workerStats[workerId - 1];
+    // Per-worker consecutive challenge failures counter for adaptive
+    // backoff (so a hard outage backs off to ~60s instead of looping at
+    // 500ms forever).
+    let consecChallengeFails = 0;
     while (!stop && totalMints < maxTokens) {
       // ---- /challenge ----
       let challenge;
@@ -732,11 +754,23 @@ async function cmdMineWorkers(args) {
         }
         ws.errors += 1;
         totalErrors += 1;
-        ui.warn(`[w${workerId}] challenge: ${describeError(e)}`);
-        await sleep(500);
+        consecChallengeFails += 1;
+        const wait = backoffMsFor(consecChallengeFails, e);
+        if (consecChallengeFails >= 3) {
+          ui.warn(
+            `[w${workerId}] challenge: ${describeError(e)} — backing off ${(wait / 1000).toFixed(1)}s (consecutive: ${consecChallengeFails})`,
+          );
+        } else {
+          ui.warn(`[w${workerId}] challenge: ${describeError(e)}`);
+        }
+        await sleep(wait);
         continue;
       }
       if (stop) return;
+      // Successful fetch — reset the outage backoff counter.
+      if (consecChallengeFails > 0) {
+        consecChallengeFails = 0;
+      }
       ws.lastDifficulty = challenge.difficulty_bits;
 
       // ---- solve ----
@@ -1073,6 +1107,23 @@ function shorten(s) {
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// Adaptive backoff for upstream API failures inside long-running mining
+// loops. A single transient blip retries quickly; a sustained outage
+// (5xx, TIMEOUT, or repeated `fetch failed`) escalates up to 60 s so we
+// don't hammer a dead api.rpow2.com with hundreds of useless requests
+// (which can also poison our IP reputation when the service recovers).
+//   consecFails  number of consecutive failures so far (>= 1).
+//   err          the last error object; used to detect server-side outages.
+function backoffMsFor(consecFails, err) {
+  const outage =
+    (err instanceof ApiError && (err.status >= 500 || err.code === 'TIMEOUT')) ||
+    /fetch failed/i.test(((err && err.message) || ''));
+  const cap = outage ? 60000 : 5000;
+  // 1.5s, 3s, 6s, 12s, 24s, 48s, then capped.
+  const ms = 1500 * Math.pow(2, Math.max(0, consecFails - 1));
+  return Math.min(cap, ms);
 }
 
 function help() {
