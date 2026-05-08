@@ -2,6 +2,7 @@
 'use strict';
 
 const readline = require('readline');
+const os = require('os');
 const session = require('./lib/session');
 const { api, ApiError, API_BASE } = require('./lib/api');
 const ui = require('./lib/ui');
@@ -617,6 +618,279 @@ async function cmdRun(args) {
   await cmdMine(args);
 }
 
+// Multi-worker mining: spawn N concurrent challenge -> solve -> mint chains
+// against a SINGLE account. Differs from `mine` (one loop, N inflight mints)
+// by also parallelizing /challenge fetches, so the API mint-pipeline can be
+// saturated past the single-fetch ceiling. GPU access is serialized via an
+// async mutex so we never have two GPU solver subprocesses fighting over the
+// device. CPU/native solvers run unconstrained per worker.
+async function cmdMineWorkers(args) {
+  const profile = args.flags.profile;
+  const state = await ensureLoggedIn(profile);
+  const me = await getMe(state);
+  if (!me) {
+    ui.err('session unexpectedly invalid right after login; aborting.');
+    process.exit(1);
+  }
+  printAccount(me, profile);
+
+  const numWorkers = Math.max(
+    1,
+    Number(args.flags.workers) || (os.cpus().length || 4),
+  );
+  const maxTokens = args.flags.max ? Number(args.flags.max) : Infinity;
+  const backend = args.flags.backend || activeBackend();
+  const binPath =
+    backend === 'native'
+      ? nativeBinaryPath()
+      : backend === 'gpu'
+      ? gpuBinaryPath()
+      : null;
+  // How many internal solver threads each worker uses per /challenge.
+  // Default 1 so N parallel workers x 1 thread = N CPU cores total.
+  const solveWorkers = Math.max(
+    1,
+    Number(args.flags['solve-workers']) || 1,
+  );
+  const refreshIntervalMs = Math.max(
+    5000,
+    Number(args.flags['refresh-ms']) || 60000,
+  );
+  const statsMs = Math.max(1000, Number(args.flags['stats-ms']) || 30000);
+  const mintRetries = Math.max(0, Number(args.flags['mint-retries']) || 3);
+  const tag = profile ? `[${profile}] ` : '';
+
+  ui.info(
+    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${numWorkers} solve-workers=${solveWorkers}. press Ctrl+C to stop.`,
+  );
+
+  // GPU mutex: chain GPU solver invocations so only one runs at a time.
+  // CPU/native backends parallelize fine across worker subprocesses.
+  let gpuChain = Promise.resolve();
+  const acquireGpu = (fn) => {
+    const prev = gpuChain;
+    let release;
+    const wait = new Promise((r) => (release = r));
+    gpuChain = wait;
+    return prev.then(async () => {
+      try {
+        return await fn();
+      } finally {
+        release();
+      }
+    });
+  };
+
+  let stop = false;
+  let totalMints = 0;
+  let totalErrors = 0;
+  let totalHashes = 0n;
+  const sessionStart = Date.now();
+  const workerStats = [];
+  for (let i = 0; i < numWorkers; i++) {
+    workerStats.push({
+      id: i + 1,
+      mints: 0,
+      errors: 0,
+      hashes: 0n,
+      lastDifficulty: 0,
+      lastSolveMs: 0,
+    });
+  }
+
+  let displayBalance = Number(me.balance) || 0;
+  let displayMinted = Number(me.minted) || 0;
+  let lastMeAt = Date.now();
+
+  const onSig = () => {
+    if (stop) {
+      ui.warn('force exit.');
+      process.exit(130);
+    }
+    stop = true;
+    ui.info('stopping all workers (waiting for in-flight) ...');
+  };
+  process.on('SIGINT', onSig);
+  process.on('SIGTERM', onSig);
+
+  const runOne = async (workerId) => {
+    const ws = workerStats[workerId - 1];
+    while (!stop && totalMints < maxTokens) {
+      // ---- /challenge ----
+      let challenge;
+      try {
+        challenge = await api.challenge(state);
+      } catch (e) {
+        if (
+          e instanceof ApiError &&
+          (e.status === 401 || e.code === 'UNAUTHORIZED')
+        ) {
+          ui.err(`[w${workerId}] session expired; stopping all workers.`);
+          stop = true;
+          session.clear(state);
+          return;
+        }
+        ws.errors += 1;
+        totalErrors += 1;
+        ui.warn(`[w${workerId}] challenge: ${describeError(e)}`);
+        await sleep(500);
+        continue;
+      }
+      if (stop) return;
+      ws.lastDifficulty = challenge.difficulty_bits;
+
+      // ---- solve ----
+      const solveStart = Date.now();
+      let found;
+      try {
+        const solveOpts = {
+          backend,
+          binary: binPath,
+          workers: solveWorkers,
+        };
+        found =
+          backend === 'gpu'
+            ? await acquireGpu(() => solveChallenge(challenge, solveOpts))
+            : await solveChallenge(challenge, solveOpts);
+      } catch (e) {
+        ws.errors += 1;
+        totalErrors += 1;
+        ui.warn(`[w${workerId}] solve: ${describeError(e)}`);
+        await sleep(500);
+        continue;
+      }
+      if (stop) return;
+      ws.lastSolveMs = Date.now() - solveStart;
+      const hashesBig =
+        typeof found.hashes === 'bigint' ? found.hashes : BigInt(found.hashes || 0);
+      ws.hashes += hashesBig;
+      totalHashes += hashesBig;
+
+      // ---- /mint with retries (transient errors only) ----
+      let mintRes = null;
+      let mintErr = null;
+      for (let attempt = 0; attempt <= mintRetries; attempt++) {
+        if (stop) return;
+        try {
+          mintRes = await api.mint(
+            {
+              challenge_id: challenge.challenge_id,
+              solution_nonce: found.solution_nonce,
+            },
+            state,
+          );
+          break;
+        } catch (e) {
+          mintErr = e;
+          if (
+            e instanceof ApiError &&
+            (e.status === 401 || e.code === 'UNAUTHORIZED')
+          ) {
+            ui.err(`[w${workerId}] session expired during mint; stopping.`);
+            stop = true;
+            session.clear(state);
+            return;
+          }
+          // Permanent failures — don't retry.
+          if (
+            e instanceof ApiError &&
+            (e.code === 'STALE_CHALLENGE' ||
+              e.code === 'CHALLENGE_NOT_FOUND' ||
+              e.code === 'INVALID_SOLUTION')
+          ) {
+            break;
+          }
+          if (attempt < mintRetries) {
+            await sleep(500 * (attempt + 1));
+          }
+        }
+      }
+
+      if (mintRes) {
+        ws.mints += 1;
+        totalMints += 1;
+        const balFromMint = pickNumber(mintRes, [
+          'balance',
+          'user.balance',
+          'account.balance',
+        ]);
+        const minFromMint = pickNumber(mintRes, [
+          'minted',
+          'user.minted',
+          'account.minted',
+        ]);
+        if (typeof balFromMint === 'number') displayBalance = balFromMint;
+        else displayBalance += 1;
+        if (typeof minFromMint === 'number') displayMinted = minFromMint;
+        else displayMinted += 1;
+        const tokenId = mintRes && mintRes.token && mintRes.token.id;
+        ui.info(
+          `+ [w${workerId}] minted${tokenId ? ` ${shorten(tokenId)}` : ''} (diff=${challenge.difficulty_bits} solve=${ws.lastSolveMs}ms #${totalMints} bal=${displayBalance})`,
+        );
+      } else if (mintErr) {
+        ws.errors += 1;
+        totalErrors += 1;
+        ui.warn(
+          `[w${workerId}] mint: ${describeError(mintErr)} (cid=${shorten(challenge.challenge_id)})`,
+        );
+      }
+
+      // Periodic /me refresh (worker #1 only, best-effort).
+      if (workerId === 1 && Date.now() - lastMeAt >= refreshIntervalMs) {
+        lastMeAt = Date.now();
+        api.me(state).then(
+          (fresh) => {
+            displayBalance = Number(fresh.balance) || displayBalance;
+            displayMinted = Number(fresh.minted) || displayMinted;
+          },
+          () => {
+            /* non-fatal */
+          },
+        );
+      }
+    }
+  };
+
+  // Periodic stats line. Useful when tokens trickle in slowly.
+  const statsTimer = setInterval(() => {
+    if (stop) return;
+    const elapsedSec = (Date.now() - sessionStart) / 1000;
+    const rate =
+      elapsedSec > 0 ? (totalMints / elapsedSec) * 60 : 0;
+    ui.info(
+      `  ${tag}stats: mints=${totalMints} errors=${totalErrors} rate=${rate.toFixed(2)} mints/min hashes=${ui.fmtNum(Number(totalHashes))} bal=${displayBalance} uptime=${ui.fmtElapsed(Date.now() - sessionStart)}`,
+    );
+  }, statsMs);
+
+  // Spawn workers in parallel, but stagger startup to avoid hammering
+  // /challenge with N concurrent requests from cold (rpow2 API rate-limits
+  // burst /challenge calls, returning 500/504). Default 750ms between
+  // starts; override with --stagger-ms=N or set 0 to disable.
+  const staggerMs = Math.max(
+    0,
+    args.flags['stagger-ms'] === undefined
+      ? 750
+      : Number(args.flags['stagger-ms']) || 0,
+  );
+  const promises = [];
+  for (let i = 1; i <= numWorkers; i++) {
+    if (i > 1 && staggerMs > 0) await sleep(staggerMs);
+    if (stop) break;
+    promises.push(runOne(i));
+  }
+  await Promise.all(promises);
+
+  clearInterval(statsTimer);
+  process.off('SIGINT', onSig);
+  process.off('SIGTERM', onSig);
+
+  const elapsedSec = (Date.now() - sessionStart) / 1000;
+  const rate = elapsedSec > 0 ? (totalMints / elapsedSec) * 60 : 0;
+  ui.info(
+    `done. mined ${totalMints} token(s) in ${ui.fmtElapsed(Date.now() - sessionStart)} (${rate.toFixed(2)} mints/min, ${totalErrors} errors).`,
+  );
+}
+
 // Spawn a child `node rpow.js mine --profile=NAME` per profile, prefixing
 // each line of stdout with the profile name. Restarts a child if it exits
 // (unless we're stopping). Default profile list = every profile present in
@@ -815,6 +1089,11 @@ rpow2 CLI miner – usage:
                     [--backend=native|node|gpu]  pick miner backend
                                        (gpu requires gpu-miner/rpow-miner-gpu.exe;
                                         build via gpu-miner/build.ps1)
+    node rpow.js mine-workers          mine with N parallel challenge->solve->mint
+                    [--workers=N]      chains (default = CPU count). Each worker
+                    [--solve-workers=K]   has its own /challenge + /mint round-trip
+                    [--backend=...]    so the API mint pipeline isn't bottlenecked
+                    [--max=N]          by a single fetch loop. GPU is mutex-shared.
     node rpow.js logout                clear local session
 
   Multi-account (each profile = its own session file in ./profiles/NAME.json):
@@ -874,6 +1153,9 @@ async function main() {
         break;
       case 'mine':
         await cmdMine(args);
+        break;
+      case 'mine-workers':
+        await cmdMineWorkers(args);
         break;
       case 'mine-all':
         await cmdMineAll(args);
