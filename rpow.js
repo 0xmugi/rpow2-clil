@@ -62,15 +62,33 @@ function describeError(e) {
   return e && e.message ? e.message : String(e);
 }
 
-async function getMe(state) {
-  try {
-    return await api.me(state);
-  } catch (e) {
-    if (e instanceof ApiError && (e.status === 401 || e.code === 'UNAUTHORIZED')) {
-      return null;
+async function getMe(state, { retries = 4 } = {}) {
+  // Transient network/API errors at startup ("fetch failed", HTTP_500) are
+  // common from any consumer ISP -> api.rpow2.com. Retry a few times with
+  // backoff before giving up so a one-shot blip doesn't kill `node rpow.js
+  // mine`. Auth errors are not retried.
+  let lastErr;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await api.me(state);
+    } catch (e) {
+      if (
+        e instanceof ApiError &&
+        (e.status === 401 || e.status === 403 || e.code === 'UNAUTHORIZED')
+      ) {
+        return null;
+      }
+      lastErr = e;
+      if (attempt < retries) {
+        const delay = 500 * (attempt + 1); // 0.5s, 1s, 1.5s, 2s
+        ui.warn(
+          `getMe failed (${describeError(e)}); retry ${attempt + 1}/${retries} in ${delay}ms`,
+        );
+        await sleep(delay);
+      }
     }
-    throw e;
   }
+  throw lastErr;
 }
 
 function printBanner() {
@@ -315,7 +333,13 @@ async function ensureLoggedIn(profile) {
 async function cmdMine(args) {
   const profile = args.flags.profile;
   const state = await ensureLoggedIn(profile);
-  const me = await api.me(state);
+  // Use the retry-aware getMe here so a one-shot network blip on the very
+  // first /me right after login doesn't kill the miner with `fetch failed`.
+  const me = await getMe(state);
+  if (!me) {
+    ui.err('session unexpectedly invalid right after login; aborting.');
+    process.exit(1);
+  }
   printAccount(me, profile);
 
   const workers = Math.max(1, Number(args.flags.workers) || defaultWorkers());
