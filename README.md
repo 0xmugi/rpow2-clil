@@ -136,162 +136,112 @@ For Windows use `https://win.rustup.rs/x86_64`. To force the Node backend
 Tested on Ubuntu 22.04 / 24.04, Debian 12, AlmaLinux 9. Should work on any
 modern systemd distro.
 
-### Step 1 — Install everything (one paste)
+There is **one** script: `setup-vps.sh`. You run it twice — first to install
+deps and build the native miner, second (after copying your profiles) to
+install systemd services. Each run is idempotent.
 
-SSH into your VPS, then paste this **whole block**:
+### Step 1 — First run: install deps + build miner
+
+SSH into your VPS and paste:
 
 ```bash
 sudo apt-get update -y && sudo apt-get install -y git curl
 git clone https://github.com/0xmugi/rpow2-clil.git ~/rpow
 cd ~/rpow
 bash setup-vps.sh
-source ~/.cargo/env   # so `cargo` is in PATH for this shell
 ```
 
-What `setup-vps.sh` does for you:
-- installs **Node.js 22** (skips if already installed)
+What it does:
+- installs **Node.js 22** (skipped if already installed)
 - installs **Rust** toolchain (rustup → `~/.cargo`)
-- installs build tools (gcc/make)
+- installs build tools (gcc/make/git)
 - builds the **native miner** (`miner-rs/target/release/rpow-miner`)
+- creates `profiles/` dir
+- prints scp instructions and exits (no profiles yet)
 
-Re-running the script is safe — it skips what's already installed.
+The script auto-detects your package manager (apt / dnf / yum / pacman).
+If your VPS is exotic, install Node 18+ and Rust manually, then run
+`cd miner-rs && cargo build --release`.
 
-For non-Debian distros (RHEL/AlmaLinux/Rocky, Arch) the script auto-detects
-your package manager. If your VPS is something exotic, just install Node 18+
-and Rust manually then run `cd miner-rs && cargo build --release`.
+### Step 2 — Copy your profiles + bot config from laptop
 
-### Step 2 — Get a session
-
-You need a `session.json` in `~/rpow/`. Pick **one** of these:
-
-**Option A — login on the VPS** (you need email access on phone/laptop):
-
-```bash
-cd ~/rpow
-node rpow.js login your@email.com
-# Open the email on your phone, copy the magic link, paste it into the SSH
-# terminal when asked. Done.
-```
-
-**Option B — copy the session from your local machine** (much easier when you
-have several VPS):
-
-On your **laptop** (where you already ran `node rpow.js login` and have a
-working `session.json`):
+From your **LAPTOP** (PowerShell or bash). Replace `VPS_IP` (and the user
+— `root` for most HostBrr/Hetzner-style VPS):
 
 ```bash
-# replace USER and VPS_IP
-scp session.json USER@VPS_IP:~/rpow/session.json
-```
-
-Then on the VPS:
-
-```bash
-cd ~/rpow
-node rpow.js status   # should show your email + balance
-```
-
-### Step 3 — Quick mining test
-
-```bash
-cd ~/rpow
-node rpow.js mine --max=2
-```
-
-You should see `backend=native` in the first log line, then 2 tokens minted
-in a few seconds. If you see `backend=node`, the Rust binary wasn't built —
-re-run `bash setup-vps.sh`.
-
-### Step 4 — Multi-account mining + Telegram bot (recommended)
-
-If you already have several profiles set up on your laptop (e.g.
-`profiles/cecen.json`, `profiles/namc.json`) and a `bot.json` with your
-Telegram token, migrating to a new VPS is two scp commands plus one script.
-
-**On your LAPTOP (PowerShell or bash)** — copy what you already have:
-
-```bash
-# replace VPS_IP and the user (root for most HostBrr/Hetzner-style VPS)
 scp profiles/*.json root@VPS_IP:~/rpow/profiles/
-scp bot.json        root@VPS_IP:~/rpow/
+scp bot.json        root@VPS_IP:~/rpow/   # only if running the bot here
 ```
 
-**On the VPS** — install both services with one script:
+Don't have profiles yet? Make them on the VPS instead:
 
 ```bash
 cd ~/rpow
-bash install-multi.sh
+node rpow.js login your@email.com --profile=name1
+node rpow.js login other@email.com --profile=name2
+```
+
+> **Migration tip:** before continuing, make sure your old VPS / laptop is
+> **not** mining the same profiles — both copies will keep invalidating each
+> other's challenges. Stop the old service first (`sudo systemctl stop rpow*`
+> or `pkill -f 'rpow.js mine'`).
+
+### Step 3 — Second run: install systemd services
+
+Back on the VPS:
+
+```bash
+cd ~/rpow
+bash setup-vps.sh   # idempotent — same script, second run
 rpow-start
 ```
 
-`install-multi.sh` will:
+This time the script:
 
-- Auto-detect every `profiles/*.json` you copied and mine all of them
-  in parallel (`mine-all --profiles=...`).
-- Install a `rpow-miner.service` systemd unit (mining loop).
-- Install a `rpow-bot.service` if `bot.json` is present (Telegram bot).
-- Auto-tune `--workers=N` so each profile gets `cores / num_profiles`.
-- Add convenience helpers to `/usr/local/bin`:
-  `rpow-start`, `rpow-stop`, `rpow-restart`, `rpow-status`,
-  `rpow-logs [miner|bot|journal]`, `rpow-update`.
-- Create a 2GB swap file on low-RAM (<2GB) plans.
+- auto-detects every `profiles/*.json` you copied
+- installs `rpow-miner.service` (`node rpow.js mine-all --profiles=...`)
+- installs `rpow-bot.service` if `bot.json` exists
+- auto-tunes `--workers=N` to `cores / num_profiles`
+- adds helper commands to `/usr/local/bin`
+- enables both services on boot
+- creates a 2GB swap file on low-RAM (<2GB) VPS
 
-It is idempotent — re-run it any time you add/remove a profile, or pass
-overrides:
+Re-run the script any time you add a profile, change config, or pull new
+code. Override defaults via env vars:
 
 ```bash
-PROFILES=cecen,namc WORKERS=2 WITH_BOT=false bash install-multi.sh
+PROFILES=cecen,namc  WORKERS=2  WITH_BOT=false  bash setup-vps.sh
 ```
 
-> **Migration tip:** before running `rpow-start` on the new VPS, make sure
-> your old VPS / laptop is **not** mining the same profiles, otherwise both
-> will keep invalidating each other's challenges and the API may rate-limit
-> you. Stop the old service first:
-> `sudo systemctl stop rpow` (old VPS) or kill the local `node rpow.js mine`.
+### Step 4 — Day-to-day commands
 
-### Step 4-alt — Single-account systemd service (legacy)
-
-If you only mine one account on the VPS, the simpler flow is:
+After Step 3 these helpers are on `$PATH`:
 
 ```bash
-cd ~/rpow
-bash install-service.sh
+rpow-start            # start miner (and bot)
+rpow-stop             # stop everything
+rpow-restart          # restart everything
+rpow-status           # service status snapshot
+rpow-logs miner       # follow miner.log
+rpow-logs bot         # follow bot.log
+rpow-logs journal     # follow systemd journal for the miner
+rpow-update           # git pull + rebuild + restart
 ```
 
-That installs and starts a service called `rpow`. To check on it:
+Or use `systemctl` directly:
 
 ```bash
-sudo systemctl status rpow      # is it running?
-journalctl -u rpow -f           # live logs
-tail -f ~/rpow/miner.log        # mining log
-sudo systemctl restart rpow     # restart it
-sudo systemctl stop rpow        # stop it
-sudo systemctl disable --now rpow   # stop + don't start at boot
+sudo systemctl status rpow-miner rpow-bot
+sudo journalctl -u rpow-miner -f
 ```
 
-To uninstall the service entirely:
+### Uninstall
 
 ```bash
-sudo systemctl disable --now rpow
-sudo rm /etc/systemd/system/rpow.service
+sudo systemctl disable --now rpow-miner rpow-bot 2>/dev/null
+sudo rm /etc/systemd/system/rpow-miner.service /etc/systemd/system/rpow-bot.service
+sudo rm /usr/local/bin/rpow-{start,stop,restart,status,logs,update}
 sudo systemctl daemon-reload
-```
-
-### Step 5 — Updating the miner later
-
-Multi-account setup (Step 4):
-
-```bash
-rpow-update     # git pull + rebuild + restart all services
-```
-
-Single-account legacy setup:
-
-```bash
-cd ~/rpow
-git pull
-( cd miner-rs && cargo build --release )
-sudo systemctl restart rpow
 ```
 
 ### Alternatives to systemd (any distro)
