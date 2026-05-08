@@ -54,7 +54,7 @@ curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
 # 2. clone / upload this folder
-git clone <repo> rpow && cd rpow
+git clone https://github.com/0xmugi/rpow2-clil.git rpow && cd rpow
 
 # 3. one-time login (you need email access for the magic link)
 node rpow.js login your@email.com
