@@ -596,6 +596,18 @@ async function cmdMineAll(args) {
       const why = sig ? `signal ${sig}` : `code ${code}`;
       if (stopping) {
         process.stdout.write(`${tag} child stopped (${why})\n`);
+        maybeFinish();
+        return;
+      }
+      // When --max is set on the orchestrator we forward it to every child
+      // and treat a clean exit as "done". Without --max, a clean exit is
+      // unexpected (no upper bound, miner shouldn't stop) so we respawn.
+      if (args.flags.max && code === 0) {
+        process.stdout.write(
+          `${tag} child finished (--max=${args.flags.max} reached); not respawning\n`,
+        );
+        finishedNames.add(name);
+        maybeFinish();
         return;
       }
       process.stdout.write(`${tag} child exited (${why}); respawning in 5s\n`);
@@ -603,6 +615,16 @@ async function cmdMineAll(args) {
         if (!stopping) spawnOne(name, idx);
       }, 5000);
     });
+  };
+
+  const finishedNames = new Set();
+  const maybeFinish = () => {
+    if (finishedNames.size >= names.length && children.size === 0) {
+      ui.info(
+        `mine-all done: ${finishedNames.size}/${names.length} profile(s) finished.`,
+      );
+      process.exit(0);
+    }
   };
 
   names.forEach((n, i) => spawnOne(n, i));
