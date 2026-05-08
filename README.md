@@ -72,76 +72,152 @@ node rpow.js mine --max=1   # should log "backend=native (.../rpow-miner)"
 For Windows use `https://win.rustup.rs/x86_64`. To force the Node backend
 (no Rust needed), pass `--backend=node` or set `RPOW_BACKEND=node`.
 
-## Running on a VPS
+## Running on a VPS — copy/paste guide
 
-Any Linux VPS with Node 18+ works.
+Tested on Ubuntu 22.04 / 24.04, Debian 12, AlmaLinux 9. Should work on any
+modern systemd distro.
+
+### Step 1 — Install everything (one paste)
+
+SSH into your VPS, then paste this **whole block**:
 
 ```bash
-# 1. install Node + Rust (Debian/Ubuntu example)
-curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-sudo apt-get install -y nodejs build-essential
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-source $HOME/.cargo/env
+sudo apt-get update -y && sudo apt-get install -y git curl
+git clone https://github.com/0xmugi/rpow2-clil.git ~/rpow
+cd ~/rpow
+bash setup-vps.sh
+source ~/.cargo/env   # so `cargo` is in PATH for this shell
+```
 
-# 2. clone / upload this folder
-git clone https://github.com/0xmugi/rpow2-clil.git rpow && cd rpow
+What `setup-vps.sh` does for you:
+- installs **Node.js 22** (skips if already installed)
+- installs **Rust** toolchain (rustup → `~/.cargo`)
+- installs build tools (gcc/make)
+- builds the **native miner** (`miner-rs/target/release/rpow-miner`)
 
-# 3. build the native miner (~30s)
-( cd miner-rs && cargo build --release )
+Re-running the script is safe — it skips what's already installed.
 
-# 4. one-time login (you need email access for the magic link)
+For non-Debian distros (RHEL/AlmaLinux/Rocky, Arch) the script auto-detects
+your package manager. If your VPS is something exotic, just install Node 18+
+and Rust manually then run `cd miner-rs && cargo build --release`.
+
+### Step 2 — Get a session
+
+You need a `session.json` in `~/rpow/`. Pick **one** of these:
+
+**Option A — login on the VPS** (you need email access on phone/laptop):
+
+```bash
+cd ~/rpow
 node rpow.js login your@email.com
-# paste the link from your inbox
+# Open the email on your phone, copy the magic link, paste it into the SSH
+# terminal when asked. Done.
+```
 
-# 5. start mining in the background
+**Option B — copy the session from your local machine** (much easier when you
+have several VPS):
+
+On your **laptop** (where you already ran `node rpow.js login` and have a
+working `session.json`):
+
+```bash
+# replace USER and VPS_IP
+scp session.json USER@VPS_IP:~/rpow/session.json
+```
+
+Then on the VPS:
+
+```bash
+cd ~/rpow
+node rpow.js status   # should show your email + balance
+```
+
+### Step 3 — Quick mining test
+
+```bash
+cd ~/rpow
+node rpow.js mine --max=2
+```
+
+You should see `backend=native` in the first log line, then 2 tokens minted
+in a few seconds. If you see `backend=node`, the Rust binary wasn't built —
+re-run `bash setup-vps.sh`.
+
+### Step 4 — Run 24/7 as a systemd service
+
+```bash
+cd ~/rpow
+bash install-service.sh
+```
+
+That installs and starts a service called `rpow`. To check on it:
+
+```bash
+sudo systemctl status rpow      # is it running?
+journalctl -u rpow -f           # live logs
+tail -f ~/rpow/miner.log        # mining log
+sudo systemctl restart rpow     # restart it
+sudo systemctl stop rpow        # stop it
+sudo systemctl disable --now rpow   # stop + don't start at boot
+```
+
+To uninstall the service entirely:
+
+```bash
+sudo systemctl disable --now rpow
+sudo rm /etc/systemd/system/rpow.service
+sudo systemctl daemon-reload
+```
+
+### Step 5 — Updating the miner later
+
+```bash
+cd ~/rpow
+git pull
+( cd miner-rs && cargo build --release )
+sudo systemctl restart rpow
+```
+
+### Alternatives to systemd (any distro)
+
+```bash
+# nohup — survives SSH disconnect
 nohup node rpow.js mine > miner.log 2>&1 &
 tail -f miner.log
-```
-
-### As a `systemd` service
-
-`/etc/systemd/system/rpow.service`:
-
-```ini
-[Unit]
-Description=rpow2 CLI miner
-After=network-online.target
-
-[Service]
-Type=simple
-User=ubuntu
-WorkingDirectory=/home/ubuntu/rpow
-ExecStart=/usr/bin/node /home/ubuntu/rpow/rpow.js mine
-Restart=on-failure
-RestartSec=10
-Environment=NODE_ENV=production
-
-[Install]
-WantedBy=multi-user.target
+disown  # so it keeps running even after your shell logs out
 ```
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable --now rpow
-journalctl -u rpow -f
-```
-
-### With `pm2`
-
-```bash
-npm i -g pm2
-pm2 start rpow.js --name rpow -- mine --workers=4
-pm2 save
-pm2 startup
-```
-
-### With `screen` / `tmux`
-
-```bash
+# screen — re-attachable session
 screen -S rpow
 node rpow.js mine
-# Ctrl+A then D to detach; `screen -r rpow` to reattach.
+# detach: Ctrl+A then D
+# reattach: screen -r rpow
 ```
+
+```bash
+# pm2 — Node-aware process manager
+npm i -g pm2
+pm2 start rpow.js --name rpow -- mine
+pm2 save
+pm2 startup     # follow the printed sudo command for boot persistence
+```
+
+### Common VPS pitfalls
+
+- **"I closed SSH and the miner stopped"** — use systemd (Step 4),
+  `nohup ... &` + `disown`, or `screen`. A plain `node rpow.js mine` dies
+  with the SSH session.
+- **`backend=node` even after building** — make sure `cargo build --release`
+  ran in `miner-rs/`. Verify the binary exists:
+  ```bash
+  ls -lh ~/rpow/miner-rs/target/release/rpow-miner
+  ```
+- **`session expired` errors** — magic-link sessions don't last forever.
+  Re-run `node rpow.js login your@email.com` (or scp a fresh
+  `session.json` from your laptop).
+- **Low hashrate on a tiny VPS** — 1 vCPU = 1 core, expect ~10–15 MH/s with
+  the native backend. Bigger CPUs scale linearly until thermal/power limits.
 
 ## Performance
 

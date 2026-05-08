@@ -1,0 +1,20 @@
+# Ensure shell scripts always use LF on every checkout, regardless of OS.
+# Without this, Windows clients turn LF into CRLF and bash refuses to run them.
+*.sh        text eol=lf
+*.bash      text eol=lf
+
+# Rust / Node sources – consistent LF
+*.rs        text eol=lf
+*.js        text eol=lf
+*.toml      text eol=lf
+*.md        text eol=lf
+*.json      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+
+# Treat binaries as binary (defensive)
+*.exe       binary
+*.bin       binary
+*.png       binary
+*.jpg       binary
+*.ico       binary
