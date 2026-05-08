@@ -2,6 +2,7 @@ node_modules/
 session.json
 profiles/
 bot.json
+.bot-state.json
 *.log
 .env
 _analysis/
