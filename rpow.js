@@ -83,15 +83,18 @@ function printBanner() {
 // ---------- commands ----------
 
 async function cmdLogin(args) {
-  const state = session.load();
+  const profile = args.flags.profile;
+  const state = session.load(profile);
   let email = args._[0] || args.flags.email;
 
   // already logged in?
   if (Object.keys(state.cookies).length > 0) {
     const me = await getMe(state).catch(() => null);
     if (me && me.email) {
-      ui.info(`already logged in as ${me.email}`);
-      ui.info(`session file: ${session.file()}`);
+      ui.info(
+        `already logged in as ${me.email}${profile ? ` (profile: ${profile})` : ''}`,
+      );
+      ui.info(`session file: ${session.file(state)}`);
       return me;
     }
   }
@@ -135,10 +138,11 @@ async function cmdLogin(args) {
   return me;
 }
 
-async function cmdLogout() {
-  const state = session.load();
+async function cmdLogout(args) {
+  const profile = args && args.flags && args.flags.profile;
+  const state = session.load(profile);
   if (Object.keys(state.cookies).length === 0) {
-    ui.info('no active session.');
+    ui.info(`no active session${profile ? ` for profile ${profile}` : ''}.`);
     return;
   }
   try {
@@ -146,14 +150,22 @@ async function cmdLogout() {
   } catch (e) {
     ui.warn(`server logout failed: ${describeError(e)}`);
   }
-  session.clear();
-  ui.info('local session cleared.');
+  session.clear(state);
+  ui.info(
+    `local session cleared${profile ? ` (profile: ${profile})` : ''}.`,
+  );
 }
 
-async function cmdStatus() {
-  const state = session.load();
+async function cmdStatus(args) {
+  const profile = args && args.flags && args.flags.profile;
+  if (!profile && args && args.flags && args.flags.all) {
+    return cmdStatusAll();
+  }
+  const state = session.load(profile);
   if (Object.keys(state.cookies).length === 0) {
-    ui.info('not logged in. run: node rpow.js login');
+    ui.info(
+      `not logged in${profile ? ` (profile: ${profile})` : ''}. run: node rpow.js login${profile ? ` --profile=${profile}` : ''}`,
+    );
     return;
   }
   const me = await getMe(state);
@@ -184,8 +196,9 @@ async function cmdStatus() {
   }
 }
 
-async function cmdActivity() {
-  const state = session.load();
+async function cmdActivity(args) {
+  const profile = args && args.flags && args.flags.profile;
+  const state = session.load(profile);
   const me = await getMe(state);
   if (!me) {
     ui.warn('not logged in.');
@@ -206,10 +219,10 @@ async function cmdActivity() {
   console.log(ui.box('ACTIVITY', lines.join('\n')));
 }
 
-function printAccount(me) {
+function printAccount(me, profile) {
   console.log(
     ui.box(
-      'ACCOUNT',
+      profile ? `ACCOUNT (${profile})` : 'ACCOUNT',
       [
         `> LOGGED IN AS: ${me.email}`,
         `> BALANCE     : ${String(me.balance).padStart(4, '0')} RPOW`,
@@ -221,27 +234,89 @@ function printAccount(me) {
   );
 }
 
-async function ensureLoggedIn() {
-  const state = session.load();
+async function cmdStatusAll() {
+  const profiles = session.list();
+  if (profiles.length === 0) {
+    ui.info('no profiles found. run: node rpow.js login [email] --profile=NAME');
+    return;
+  }
+  let totalBalance = 0;
+  let totalMinted = 0;
+  const rows = [];
+  for (const p of profiles) {
+    const profileArg = p.name === 'default' ? null : p.name;
+    const state = session.load(profileArg);
+    if (Object.keys(state.cookies).length === 0) {
+      rows.push(
+        `${p.name.padEnd(14)} (no session)`,
+      );
+      continue;
+    }
+    let me;
+    try {
+      me = await api.me(state);
+    } catch (e) {
+      rows.push(
+        `${p.name.padEnd(14)} ${state.email || '?'}  ERR ${describeError(e)}`,
+      );
+      continue;
+    }
+    totalBalance += Number(me.balance) || 0;
+    totalMinted += Number(me.minted) || 0;
+    rows.push(
+      `${p.name.padEnd(14)} ${String(me.email).padEnd(28)}  bal=${String(me.balance).padStart(5)}  minted=${String(me.minted).padStart(5)}`,
+    );
+  }
+  rows.push('');
+  rows.push(
+    `TOTAL                                          bal=${String(totalBalance).padStart(5)}  minted=${String(totalMinted).padStart(5)}`,
+  );
+  console.log(ui.box('ALL PROFILES', rows.join('\n')));
+}
+
+async function cmdProfiles() {
+  const profiles = session.list();
+  if (profiles.length === 0) {
+    console.log(
+      ui.box(
+        'PROFILES',
+        '(none)\n\nLogin a new profile with:\n  node rpow.js login your@email.com --profile=NAME',
+      ),
+    );
+    return;
+  }
+  const rows = profiles.map(
+    (p) => `${p.name.padEnd(14)} ${p.file}`,
+  );
+  console.log(ui.box('PROFILES', rows.join('\n')));
+}
+
+async function ensureLoggedIn(profile) {
+  const state = session.load(profile);
   if (Object.keys(state.cookies).length === 0) {
-    ui.info('no session – starting login flow.');
-    await cmdLogin({ _: [], flags: {} });
-    return session.load();
+    ui.info(
+      `no session${profile ? ` for profile ${profile}` : ''} – starting login flow.`,
+    );
+    await cmdLogin({ _: [], flags: { profile } });
+    return session.load(profile);
   }
   const me = await getMe(state);
   if (!me) {
-    ui.warn('session expired – starting login flow.');
-    session.clear();
-    await cmdLogin({ _: [], flags: {} });
-    return session.load();
+    ui.warn(
+      `session expired${profile ? ` for profile ${profile}` : ''} – starting login flow.`,
+    );
+    session.clear(state);
+    await cmdLogin({ _: [], flags: { profile } });
+    return session.load(profile);
   }
   return state;
 }
 
 async function cmdMine(args) {
-  const state = await ensureLoggedIn();
+  const profile = args.flags.profile;
+  const state = await ensureLoggedIn(profile);
   const me = await api.me(state);
-  printAccount(me);
+  printAccount(me, profile);
 
   const workers = Math.max(1, Number(args.flags.workers) || defaultWorkers());
   const maxTokens = args.flags.max ? Number(args.flags.max) : Infinity;
@@ -251,9 +326,10 @@ async function cmdMine(args) {
     5000,
     Number(args.flags['refresh-ms']) || 60000,
   );
+  const tag = profile ? `[${profile}] ` : '';
 
   ui.info(
-    `backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers}. press Ctrl+C to stop.`,
+    `${tag}backend=${backend}${binPath ? ` (${binPath})` : ''} workers=${workers}. press Ctrl+C to stop.`,
   );
 
   let stop = false;
@@ -296,8 +372,8 @@ async function cmdMine(args) {
         e instanceof ApiError &&
         (e.status === 401 || e.code === 'UNAUTHORIZED')
       ) {
-        ui.warn('session expired mid-mining; re-login required.');
-        session.clear();
+        ui.warn(`${tag}session expired mid-mining; re-login required.`);
+        session.clear(state);
         break;
       }
       ui.err(`challenge failed: ${describeError(e)}`);
@@ -436,6 +512,131 @@ async function cmdRun(args) {
   await cmdMine(args);
 }
 
+// Spawn a child `node rpow.js mine --profile=NAME` per profile, prefixing
+// each line of stdout with the profile name. Restarts a child if it exits
+// (unless we're stopping). Default profile list = every profile present in
+// session.list(); override with `--profiles=a,b,c`.
+async function cmdMineAll(args) {
+  const { spawn } = require('child_process');
+  let names;
+  if (args.flags.profiles) {
+    names = String(args.flags.profiles)
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  } else {
+    names = session
+      .list()
+      .map((p) => p.name)
+      .filter((n) => n !== 'default');
+    if (names.length === 0) {
+      const def = session.load();
+      if (Object.keys(def.cookies).length > 0) names = ['default'];
+    }
+  }
+  if (names.length === 0) {
+    ui.err('no profiles to mine. login first: node rpow.js login your@email.com --profile=NAME');
+    process.exit(2);
+  }
+
+  // Pick a sensible per-child worker count: split CPUs across children,
+  // leaving 1 core free for the orchestrator + network.
+  const cpus =
+    (require('os').availableParallelism &&
+      require('os').availableParallelism()) ||
+    require('os').cpus().length ||
+    2;
+  const totalWorkers = Math.max(1, cpus - 1);
+  const perChild = Math.max(
+    1,
+    Number(args.flags.workers) || Math.floor(totalWorkers / names.length),
+  );
+
+  ui.info(
+    `mine-all profiles=${names.join(',')} workers/child=${perChild} (cpu=${cpus})`,
+  );
+
+  let stopping = false;
+  const children = new Map();
+
+  const colors = ['36', '33', '32', '35', '34', '31'];
+  const tagFor = (name, idx) => {
+    const c = colors[idx % colors.length];
+    const lbl = name.padEnd(10).slice(0, 10);
+    return process.stdout.isTTY ? `\x1b[${c}m[${lbl}]\x1b[0m` : `[${lbl}]`;
+  };
+
+  const spawnOne = (name, idx) => {
+    const argv = [
+      __filename,
+      'mine',
+      `--profile=${name}`,
+      `--workers=${perChild}`,
+    ];
+    if (args.flags.max) argv.push(`--max=${args.flags.max}`);
+    if (args.flags.backend) argv.push(`--backend=${args.flags.backend}`);
+    const child = spawn(process.execPath, argv, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: process.env,
+    });
+    children.set(name, child);
+    const tag = tagFor(name, idx);
+
+    const linePrefix = (chunk) => {
+      const lines = chunk.toString().split(/\r?\n/);
+      for (const line of lines) {
+        if (line) process.stdout.write(`${tag} ${line}\n`);
+      }
+    };
+    child.stdout.on('data', linePrefix);
+    child.stderr.on('data', linePrefix);
+
+    child.on('exit', (code, sig) => {
+      children.delete(name);
+      const why = sig ? `signal ${sig}` : `code ${code}`;
+      if (stopping) {
+        process.stdout.write(`${tag} child stopped (${why})\n`);
+        return;
+      }
+      process.stdout.write(`${tag} child exited (${why}); respawning in 5s\n`);
+      setTimeout(() => {
+        if (!stopping) spawnOne(name, idx);
+      }, 5000);
+    });
+  };
+
+  names.forEach((n, i) => spawnOne(n, i));
+
+  const onSig = () => {
+    if (stopping) {
+      ui.warn('force exit.');
+      process.exit(130);
+    }
+    stopping = true;
+    ui.info(`stopping ${children.size} child(ren) ...`);
+    for (const c of children.values()) {
+      try {
+        c.kill('SIGINT');
+      } catch {
+        /* ignore */
+      }
+    }
+    setTimeout(() => process.exit(0), 5000).unref();
+  };
+  process.on('SIGINT', onSig);
+  process.on('SIGTERM', onSig);
+
+  // Block forever (or until all children exit and we're stopping).
+  await new Promise(() => {});
+}
+
+// ---------- Telegram bot ----------
+
+async function cmdBot(args) {
+  const bot = require('./lib/bot');
+  await bot.run(args);
+}
+
 // Look up the first present numeric value at any of the dotted paths.
 // Used to extract balance/minted counters from /mint responses without
 // caring about the exact server schema.
@@ -471,19 +672,39 @@ function help() {
   console.log(`
 rpow2 CLI miner – usage:
 
-  node rpow.js                       login (if needed) and mine continuously
-  node rpow.js login [email]         request magic link and verify
-  node rpow.js status                show account + public ledger
-  node rpow.js activity              show recent transfers
-  node rpow.js mine [--workers=N]    mine continuously (default workers = CPU-1)
-                  [--max=N]          stop after N tokens
-                  [--backend=native|node]  pick miner backend (auto = native if built)
-  node rpow.js logout                clear local session
+  Single account (legacy):
+    node rpow.js                       login (if needed) and mine continuously
+    node rpow.js login [email]         request magic link and verify
+    node rpow.js status                show account + public ledger
+    node rpow.js activity              show recent transfers
+    node rpow.js mine [--workers=N]    mine continuously (default workers = CPU-1)
+                    [--max=N]          stop after N tokens
+                    [--backend=native|node]  pick miner backend
+    node rpow.js logout                clear local session
+
+  Multi-account (each profile = its own session file in ./profiles/NAME.json):
+    node rpow.js login EMAIL --profile=NAME       login a profile
+    node rpow.js status      --profile=NAME       status for one profile
+    node rpow.js status-all                       status for every profile
+    node rpow.js profiles                         list all profiles
+    node rpow.js mine        --profile=NAME       mine one profile
+    node rpow.js mine-all [--profiles=a,b,c]      mine every profile in parallel
+                          [--workers=N]            workers per child
+    node rpow.js logout      --profile=NAME       remove a profile
+
+  Telegram bot (status / monitoring):
+    node rpow.js bot                              run the Telegram bot
+                                                  (reads ./bot.json or
+                                                   TELEGRAM_BOT_TOKEN env)
+
   node rpow.js help                  this message
 
 Environment:
-  RPOW_API_BASE       override API base (default ${API_BASE})
-  RPOW_SESSION_FILE   override session file path (default ./session.json)
+  RPOW_API_BASE              override API base (default ${API_BASE})
+  RPOW_SESSION_FILE          override default session file
+  RPOW_BACKEND=native|node   force miner backend
+  TELEGRAM_BOT_TOKEN         token for the bot command
+  TELEGRAM_ALLOWED_CHATS     comma-separated chat IDs allowed to query the bot
 `);
 }
 
@@ -500,17 +721,29 @@ async function main() {
         await cmdLogin(args);
         break;
       case 'logout':
-        await cmdLogout();
+        await cmdLogout(args);
         break;
       case 'status':
       case 'me':
-        await cmdStatus();
+        await cmdStatus(args);
+        break;
+      case 'status-all':
+        await cmdStatusAll();
+        break;
+      case 'profiles':
+        await cmdProfiles();
         break;
       case 'activity':
-        await cmdActivity();
+        await cmdActivity(args);
         break;
       case 'mine':
         await cmdMine(args);
+        break;
+      case 'mine-all':
+        await cmdMineAll(args);
+        break;
+      case 'bot':
+        await cmdBot(args);
         break;
       case 'help':
       case '--help':
