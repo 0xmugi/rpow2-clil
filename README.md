@@ -53,6 +53,65 @@ node rpow.js help
 The session cookie is stored in `./session.json` (chmod 600). To use a
 different file, set `RPOW_SESSION_FILE=/path/to/session.json`.
 
+## Multiple accounts (profiles)
+
+Each profile is a separate session file under `./profiles/NAME.json`.
+
+```bash
+# 1. login each account into its own profile
+node rpow.js login alice@example.com --profile=alice
+node rpow.js login bob@example.com   --profile=bob
+node rpow.js login carol@example.com --profile=carol
+
+# 2. inspect
+node rpow.js profiles                       # list profile files
+node rpow.js status --profile=alice         # one profile
+node rpow.js status-all                     # every profile + grand total
+
+# 3. mine all profiles in parallel from one terminal
+node rpow.js mine-all                        # auto-discovers ./profiles/*.json
+node rpow.js mine-all --profiles=alice,bob   # subset
+node rpow.js mine-all --workers=4            # workers per child (default = CPU/N)
+
+# 4. mine just one profile
+node rpow.js mine --profile=alice
+```
+
+`mine-all` spawns one `node rpow.js mine --profile=NAME` child per account
+and prefixes each output line with the profile name. Children auto-restart
+on failure. `Ctrl+C` stops all of them.
+
+CPU split: by default workers per child = `(CPU-1) / N`. Adjust with
+`--workers` if you want to over- or under-provision.
+
+## Telegram bot (status from your phone)
+
+`node rpow.js bot` runs a long-polling bot that lets you check balances
+across all profiles from Telegram.
+
+Setup:
+
+1. Create a bot with [@BotFather](https://t.me/BotFather) → get the token.
+2. Put the token in `./bot.json` (gitignored):
+
+   ```json
+   {
+     "telegram_token": "1234567890:AA...",
+     "allowed_chat_ids": []
+   }
+   ```
+
+   Or set `TELEGRAM_BOT_TOKEN` in the environment.
+3. Run `node rpow.js bot`. The first time, send `/whoami` from your
+   Telegram chat to get your numeric chat ID, then add it to
+   `allowed_chat_ids` so nobody else can query your balances.
+4. Available commands:
+   - `/status` (or `/me`, `/balance`) — balances for every profile + total
+   - `/profiles` — list of configured profiles
+   - `/ledger` — public ledger snapshot (difficulty, supply)
+   - `/whoami` — show your chat id (for setup)
+   - `/help`
+
 ## Building the native miner
 
 ```bash
